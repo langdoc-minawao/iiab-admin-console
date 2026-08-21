@@ -784,6 +784,7 @@ def cmd_handler(cmd_msg):
         "UPGRADE-ZIMS": {"funct": upgrade_zims, "inet_req": True},
         "COPY-ZIMS": {"funct": copy_zims, "inet_req": False},
         "SYNC-ZIMS": {"funct": sync_zims, "inet_req": False},
+        "SYNC-CALIBRE-WEB": {"funct": sync_calibre_web, "inet_req": False},
         "MAKE-KIWIX-LIB": {"funct": make_kiwix_lib, "inet_req": False}, # runs as job
         "RESTART-KIWIX": {"funct": restart_kiwix, "inet_req": False}, # runs immediately
         "GET-OER2GO-CAT": {"funct": get_oer2go_catalog, "inet_req": True},
@@ -3288,7 +3289,7 @@ def get_sync_remote_host(source_host, source_user=None):
     return source_host
 
 def get_sync_ssh_command():
-    return "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
+    return "/usr/bin/ssh -i /root/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/root/.ssh/known_hosts -o ConnectTimeout=5"
 
 def check_sync_ssh_access(remote_host):
     ssh_args = shlex.split(get_sync_ssh_command()) + [remote_host, "true"]
@@ -3297,6 +3298,48 @@ def check_sync_ssh_access(remote_host):
         return result.returncode == 0
     except:
         return False
+
+def get_sync_ssh_error(remote_host):
+    ssh_args = shlex.split(get_sync_ssh_command()) + [remote_host, "true"]
+    try:
+        result = subprocess.run(ssh_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12, universal_newlines=True)
+        if result.returncode == 0:
+            return ""
+        err = result.stderr.strip()
+        if err == "":
+            err = result.stdout.strip()
+        if err == "":
+            err = "ssh exited with return code " + str(result.returncode)
+        return err[-500:]
+    except subprocess.TimeoutExpired:
+        return "ssh timed out"
+    except Exception as e:
+        return str(e)
+
+def check_sync_remote_command(remote_host, remote_command):
+    ssh_args = shlex.split(get_sync_ssh_command()) + [remote_host, remote_command]
+    try:
+        result = subprocess.run(ssh_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        return result.returncode == 0
+    except:
+        return False
+
+def get_sync_remote_command_error(remote_host, remote_command):
+    ssh_args = shlex.split(get_sync_ssh_command()) + [remote_host, remote_command]
+    try:
+        result = subprocess.run(ssh_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, universal_newlines=True)
+        if result.returncode == 0:
+            return ""
+        err = result.stderr.strip()
+        if err == "":
+            err = result.stdout.strip()
+        if err == "":
+            err = "remote command exited with return code " + str(result.returncode)
+        return err[-500:]
+    except subprocess.TimeoutExpired:
+        return "remote command timed out"
+    except Exception as e:
+        return str(e)
 
 def validate_sync_zim_file_ref(file_ref):
     if not isinstance(file_ref, str):
@@ -3362,6 +3405,9 @@ def sync_zims(cmd_info):
 
     remote_host = get_sync_remote_host(safe_source_host, safe_source_user)
     if not check_sync_ssh_access(remote_host):
+        ssh_error = get_sync_ssh_error(remote_host)
+        if ssh_error != "":
+            return cmd_error(cmd=cmd_info['cmd'], msg='Unable to connect to sync source over SSH: ' + ssh_error)
         return cmd_error(cmd=cmd_info['cmd'], msg='Unable to connect to sync source over SSH')
 
     ssh_command = shlex.quote(get_sync_ssh_command())
@@ -3421,6 +3467,86 @@ def sync_oer2go_mod(cmd_info):
     job_id = request_one_job(cmd_info, job_command, 1, -1, "Y")
     job_command = "scripts/oer2go_install_move.sh " + shlex.quote(safe_moddir)
     resp = request_job(cmd_info=cmd_info, job_command=job_command, cmd_step_no=2, depend_on_job_id=job_id, has_dependent="N")
+    return resp
+
+def sync_calibre_web(cmd_info):
+    try:
+        source_host = cmd_info['cmd_args']['source_host']
+    except:
+        return cmd_malformed(cmd_info['cmd'])
+
+    safe_source_host = validate_sync_source_host(source_host)
+    source_user = cmd_info['cmd_args'].get('source_user')
+    safe_source_user = validate_sync_source_user(source_user)
+
+    if safe_source_host == None:
+        return cmd_error(cmd=cmd_info['cmd'], msg='Invalid source host')
+    if source_user != None and safe_source_user == None:
+        return cmd_error(cmd=cmd_info['cmd'], msg='Invalid source user')
+
+    remote_host = get_sync_remote_host(safe_source_host, safe_source_user)
+    ssh_error = get_sync_ssh_error(remote_host)
+    if ssh_error != "":
+        return cmd_error(cmd=cmd_info['cmd'], msg='Unable to connect to sync source over SSH: ' + ssh_error)
+
+    calibre_web_dir = "/library/calibre-web"
+    calibre_web_config_db = calibre_web_dir + "/config/app.db"
+    calibre_web_metadata_db = calibre_web_dir + "/metadata.db"
+    remote_snapshot_dir = "/tmp/calibre-web-sync"
+    ssh_command = get_sync_ssh_command()
+
+    if not os.path.isdir(calibre_web_dir):
+        return cmd_error(cmd=cmd_info['cmd'], msg='Calibre Web directory not found on destination')
+    if not os.path.isfile(calibre_web_config_db):
+        return cmd_error(cmd=cmd_info['cmd'], msg='Calibre Web app database not found on destination')
+    if not os.path.isfile(calibre_web_metadata_db):
+        return cmd_error(cmd=cmd_info['cmd'], msg='Calibre metadata database not found on destination')
+    if shutil.which("rsync") == None:
+        return cmd_error(cmd=cmd_info['cmd'], msg='rsync is not installed on destination')
+    if shutil.which("sqlite3") == None:
+        return cmd_error(cmd=cmd_info['cmd'], msg='sqlite3 is not installed on destination')
+
+    remote_prereq_cmd = "test -d " + shlex.quote(calibre_web_dir)
+    remote_prereq_cmd += " && test -f " + shlex.quote(calibre_web_config_db)
+    remote_prereq_cmd += " && test -f " + shlex.quote(calibre_web_metadata_db)
+    remote_prereq_cmd += " && command -v sqlite3 >/dev/null"
+    remote_prereq_error = get_sync_remote_command_error(remote_host, remote_prereq_cmd)
+    if remote_prereq_error != "":
+        return cmd_error(cmd=cmd_info['cmd'], msg='Calibre Web files or sqlite3 not available on source: ' + remote_prereq_error)
+
+    remote_snapshot_cmd = "mkdir -p " + shlex.quote(remote_snapshot_dir)
+    remote_snapshot_cmd += " && sqlite3 " + shlex.quote(calibre_web_config_db)
+    remote_snapshot_cmd += " " + shlex.quote(".backup " + remote_snapshot_dir + "/app.db")
+    remote_snapshot_cmd += " && sqlite3 " + shlex.quote(calibre_web_metadata_db)
+    remote_snapshot_cmd += " " + shlex.quote(".backup " + remote_snapshot_dir + "/metadata.db")
+    remote_snapshot_cmd += " && chmod 644 " + shlex.quote(remote_snapshot_dir + "/app.db")
+    remote_snapshot_cmd += " " + shlex.quote(remote_snapshot_dir + "/metadata.db")
+
+    script_lines = [
+        "set -e",
+        "CALIBRE_WEB_DIR=" + shlex.quote(calibre_web_dir),
+        "REMOTE=" + shlex.quote(remote_host),
+        "SSH_CMD=" + shlex.quote(ssh_command),
+        "SNAPSHOT_DIR=" + shlex.quote(remote_snapshot_dir),
+        "BACKUP_DIR=/library/backup/calibre-web-sync-$(date +%Y%m%d-%H%M%S)",
+        "$SSH_CMD \"$REMOTE\" " + shlex.quote(remote_snapshot_cmd),
+        "systemctl stop calibre-web",
+        "trap 'systemctl start calibre-web' EXIT",
+        "mkdir -p \"$BACKUP_DIR\"",
+        "rsync -a \"$CALIBRE_WEB_DIR/\" \"$BACKUP_DIR/calibre-web/\"",
+        "rsync -a --delete --exclude='config/app.db' --exclude='metadata.db' -e \"$SSH_CMD\" \"$REMOTE:$CALIBRE_WEB_DIR/\" \"$CALIBRE_WEB_DIR/\"",
+        "rsync -a -e \"$SSH_CMD\" \"$REMOTE:$SNAPSHOT_DIR/app.db\" \"$CALIBRE_WEB_DIR/config/app.db\"",
+        "rsync -a -e \"$SSH_CMD\" \"$REMOTE:$SNAPSHOT_DIR/metadata.db\" \"$CALIBRE_WEB_DIR/metadata.db\"",
+        "chown -R root:www-data \"$CALIBRE_WEB_DIR\"",
+        "find \"$CALIBRE_WEB_DIR\" -type d -exec chmod 755 {} +",
+        "find \"$CALIBRE_WEB_DIR\" -type f -exec chmod 644 {} +",
+        "systemctl start calibre-web",
+        "systemctl is-active calibre-web",
+        "trap - EXIT",
+        "echo \"Calibre Web cloned from $REMOTE. Backup saved to $BACKUP_DIR\""
+    ]
+    job_command = "/bin/bash -lc " + shlex.quote("\n".join(script_lines))
+    resp = request_job(cmd_info=cmd_info, job_command=job_command)
     return resp
 
 def get_oer2go_stat(cmd_info):
