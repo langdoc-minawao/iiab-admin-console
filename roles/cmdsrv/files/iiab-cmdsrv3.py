@@ -1237,9 +1237,7 @@ def validate_sync_source_host(source_host):
         return None
 
     try:
-        ip_addr = ipaddress.ip_address(source_host)
-        if ip_addr.version == 6:
-            return "[" + source_host + "]"
+        ipaddress.ip_address(source_host)
         return source_host
     except ValueError:
         pass
@@ -1278,8 +1276,11 @@ def get_local_ip_addresses():
 
 def unescape_avahi_field(value):
     def replace_match(match):
-        return chr(int(match.group(1), 10))
-    return re.sub(r"\\([0-7]{3})", replace_match, value)
+        char_code = int(match.group(1), 10)
+        if char_code <= 255:
+            return chr(char_code)
+        return match.group(0)
+    return re.sub(r"\\([0-9]{3})", replace_match, value)
 
 def is_sync_discovery_address_usable(address):
     try:
@@ -1291,12 +1292,18 @@ def is_sync_discovery_address_usable(address):
 def parse_avahi_txt_records(parts):
     txt_records = {}
 
-    for value in parts[9:]:
-        value = unescape_avahi_field(value).strip('"')
-        if "=" not in value:
+    for txt_field in parts[9:]:
+        try:
+            txt_values = shlex.split(txt_field)
+        except ValueError:
             continue
-        key, record_value = value.split("=", 1)
-        txt_records[key] = record_value
+
+        for value in txt_values:
+            value = unescape_avahi_field(value)
+            if "=" not in value:
+                continue
+            key, record_value = value.split("=", 1)
+            txt_records[key] = record_value
 
     return txt_records
 
@@ -1381,7 +1388,7 @@ def get_sync_content(cmd_info):
     if safe_source_host == None:
         return cmd_error(cmd=cmd_info['cmd'], msg='Invalid source host')
 
-    inventory_url = "http://" + safe_source_host + sync_content_inventory_path
+    inventory_url = "http://" + format_sync_ipv6_host(safe_source_host) + sync_content_inventory_path
 
     try:
         with urllib.request.urlopen(inventory_url, timeout=10) as response:
@@ -3287,6 +3294,17 @@ def get_sync_remote_host(source_host, source_user=None):
         return source_user + "@" + source_host
     return source_host
 
+def format_sync_ipv6_host(source_host):
+    try:
+        if ipaddress.ip_address(source_host).version == 6:
+            return "[" + source_host + "]"
+    except ValueError:
+        pass
+    return source_host
+
+def get_sync_rsync_host(source_host, source_user=None):
+    return get_sync_remote_host(format_sync_ipv6_host(source_host), source_user)
+
 def get_sync_ssh_command():
     return "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
 
@@ -3364,14 +3382,15 @@ def sync_zims(cmd_info):
     if not check_sync_ssh_access(remote_host):
         return cmd_error(cmd=cmd_info['cmd'], msg='Unable to connect to sync source over SSH')
 
+    remote_rsync_host = get_sync_rsync_host(safe_source_host, safe_source_user)
     ssh_command = shlex.quote(get_sync_ssh_command())
-    remote_zim_source = remote_host + ":" + zim_content_dir + safe_file_ref + ".zim*"
+    remote_zim_source = remote_rsync_host + ":" + zim_content_dir + safe_file_ref + ".zim*"
     job_command = "/usr/bin/rsync -rPt --size-only -e " + ssh_command
     job_command += " " + shlex.quote(remote_zim_source)
     job_command += " " + shlex.quote(target_dir + "/content")
     job_id = request_one_job(cmd_info, job_command, 1, -1, "Y")
 
-    remote_index_source = remote_host + ":" + zim_index_dir + safe_file_ref + ".zim.idx"
+    remote_index_source = remote_rsync_host + ":" + zim_index_dir + safe_file_ref + ".zim.idx"
     job_command = "/usr/bin/rsync -rPt --size-only --ignore-missing-args -e " + ssh_command
     job_command += " " + shlex.quote(remote_index_source)
     job_command += " " + shlex.quote(target_dir + "/index")
@@ -3413,7 +3432,8 @@ def sync_oer2go_mod(cmd_info):
     if not check_sync_ssh_access(remote_host):
         return cmd_error(cmd=cmd_info['cmd'], msg='Unable to connect to sync source over SSH')
 
-    remote_source = remote_host + ":" + modules_dir + safe_moddir
+    remote_rsync_host = get_sync_rsync_host(safe_source_host, safe_source_user)
+    remote_source = remote_rsync_host + ":" + modules_dir + safe_moddir
     job_command = "/usr/bin/rsync -rPt --size-only -e " + shlex.quote(get_sync_ssh_command())
     job_command += " " + shlex.quote(remote_source)
     job_command += " " + shlex.quote(rachel_working_dir)
