@@ -107,7 +107,8 @@ osm_version = None
 modules_dir = None
 small_device_size = 525000 # bigger than anticipated boot partition
 sync_content_inventory_path = "/common/assets/iiab-sync/content.json"
-sync_module_meta_required_fields = ["moddir", "title", "description", "lang", "ksize", "menu_item_name", "intended_use"]
+sync_module_meta_required_fields = ["moddir", "title"]
+sync_module_meta_optional_text_fields = ["description", "lang", "menu_item_name", "intended_use"]
 js_menu_dir = None
 tailscale_login_url = 'https://controlplane.tailscale.com'
 tailscale_iiab_login_url = 'https://iiab.net'
@@ -1502,6 +1503,7 @@ def build_sync_module_inventory():
                     "reason": invalid_reason
                 })
                 continue
+            module = complete_sync_module_meta(module, moddir, modpath)
             module["source"] = "iiab-meta"
             modules.append(module)
         except:
@@ -1512,15 +1514,36 @@ def build_sync_module_inventory():
 
     return modules, invalid_modules
 
+def get_sync_module_ksize(modpath):
+    total_bytes = 0
+    for root, dirs, files in os.walk(modpath):
+        for filename in files:
+            total_bytes += os.path.getsize(os.path.join(root, filename))
+    return (total_bytes + 1023) // 1024
+
+def complete_sync_module_meta(module, moddir, modpath):
+    module = dict(module)
+    defaults = {
+        "description": "",
+        "lang": "und",
+        "menu_item_name": moddir,
+        "intended_use": "html"
+    }
+
+    for field, default_value in defaults.items():
+        if field not in module or module[field].strip() == "":
+            module[field] = default_value
+
+    module["ksize"] = get_sync_module_ksize(modpath)
+    return module
+
 def validate_sync_module_meta(module, moddir):
     if not isinstance(module, dict):
         return "invalid .iiab-meta"
 
     missing_fields = []
     for field in sync_module_meta_required_fields:
-        if field not in module:
-            missing_fields.append(field)
-        elif isinstance(module[field], str) and module[field].strip() == "":
+        if field not in module or not isinstance(module[field], str) or module[field].strip() == "":
             missing_fields.append(field)
 
     if len(missing_fields) > 0:
@@ -1529,10 +1552,9 @@ def validate_sync_module_meta(module, moddir):
     if module["moddir"] != moddir:
         return ".iiab-meta moddir does not match module directory"
 
-    try:
-        int(module["ksize"])
-    except:
-        return ".iiab-meta ksize must be an integer"
+    for field in sync_module_meta_optional_text_fields:
+        if field in module and not isinstance(module[field], str):
+            return ".iiab-meta " + field + " must be a string"
 
     return None
 
